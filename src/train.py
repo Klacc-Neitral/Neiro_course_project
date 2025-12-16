@@ -43,26 +43,16 @@ class KoreanChatDataset(Dataset):
             input_text = "안녕하세요"
             target_text = "안녕하세요"
 
-        # Современный способ: один вызов с text_target без as_target_tokenizer (v4.36+)
+        # Современный способ: один вызов с text_target (без as_target_tokenizer).
+        # ВАЖНО: здесь НЕ делаем паддинг и НЕ маскируем -100.
+        # Этим займётся DataCollatorForSeq2Seq (он сам добавит паддинг и заменит pad_token_id на -100 в labels).
         model_inputs = self.tokenizer(
             input_text,
             max_length=self.max_length,
-            padding="max_length",
             truncation=True,
             text_target=target_text,
         )
 
-        # labels уже в model_inputs, извлекаем и маскируем паддинги
-        labels = model_inputs["labels"]
-
-        pad_token_id = self.tokenizer.pad_token_id
-        if pad_token_id is None:
-            pad_token_id = self.tokenizer.eos_token_id or 0
-            self.tokenizer.pad_token_id = pad_token_id
-
-        # Маскируем паддинги как -100, чтобы не входили в loss
-        labels = [tid if tid != pad_token_id else -100 for tid in labels]
-        model_inputs["labels"] = labels
         return model_inputs
 
 
@@ -183,14 +173,17 @@ def train():
     print("Проверка примера:")
     print(f"  input_ids length: {len(sample['input_ids'])}")
     print(f"  labels length: {len(sample['labels'])}")
-    print(f"  labels != -100: {sum(1 for x in sample['labels'] if x != -100)}")
+    # На этом этапе паддинги ещё не заменены на -100 (это сделает collator),
+    # поэтому просто выводим первые несколько id для визуальной проверки.
+    print(f"  first 10 input_ids: {sample['input_ids'][:10]}")
+    print(f"  first 10 labels: {sample['labels'][:10]}")
     print(f"  pad_token_id: {tokenizer.pad_token_id}")
 
     # 4. Аргументы обучения
     print("\n4. Настройка параметров обучения...")
     args = Seq2SeqTrainingArguments(
         output_dir=str(config.MODELS_DIR / "checkpoints"),
-        eval_strategy="epoch",  # современный параметр в transformers>=4.36
+        evaluation_strategy="epoch",  # корректный параметр для transformers>=4.30
         save_strategy="epoch",
         learning_rate=config.TRAIN_CONFIG["learning_rate"],
         per_device_train_batch_size=config.TRAIN_CONFIG["batch_size"],
