@@ -43,22 +43,17 @@ class KoreanChatDataset(Dataset):
             input_text = "안녕하세요"
             target_text = "안녕하세요"
 
-        # Токенизация входа
+        # Современный способ: один вызов с text_target без as_target_tokenizer (v4.36+)
         model_inputs = self.tokenizer(
             input_text,
             max_length=self.max_length,
             padding="max_length",
             truncation=True,
+            text_target=target_text,
         )
 
-        # Токенизация цели (labels)
-        with self.tokenizer.as_target_tokenizer():
-            labels = self.tokenizer(
-                target_text,
-                max_length=self.max_length,
-                padding="max_length",
-                truncation=True,
-            )["input_ids"]
+        # labels уже в model_inputs, извлекаем и маскируем паддинги
+        labels = model_inputs["labels"]
 
         pad_token_id = self.tokenizer.pad_token_id
         if pad_token_id is None:
@@ -185,18 +180,17 @@ def train():
     
     # Проверка первого примера
     sample = train_dataset[0]
-    print(f"Проверка примера:")
+    print("Проверка примера:")
     print(f"  input_ids length: {len(sample['input_ids'])}")
     print(f"  labels length: {len(sample['labels'])}")
     print(f"  labels != -100: {sum(1 for x in sample['labels'] if x != -100)}")
-    print(f"  labels не -100: {(sample['labels'] != -100).sum().item()} токенов")
     print(f"  pad_token_id: {tokenizer.pad_token_id}")
 
     # 4. Аргументы обучения
     print("\n4. Настройка параметров обучения...")
     args = Seq2SeqTrainingArguments(
         output_dir=str(config.MODELS_DIR / "checkpoints"),
-        evaluation_strategy="epoch",  # современный параметр в transformers>=4.36
+        eval_strategy="epoch",  # современный параметр в transformers>=4.36
         save_strategy="epoch",
         learning_rate=config.TRAIN_CONFIG["learning_rate"],
         per_device_train_batch_size=config.TRAIN_CONFIG["batch_size"],
