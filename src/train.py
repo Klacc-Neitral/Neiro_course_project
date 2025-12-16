@@ -8,17 +8,19 @@ sys.path.insert(0, str(BASE_DIR))
 import config
 from src.utils import load_chatbot_data, split_dataset
 from transformers import (
-    AutoTokenizer, 
-    AutoModelForSeq2SeqLM, 
-    Seq2SeqTrainingArguments, 
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    Seq2SeqTrainingArguments,
     Seq2SeqTrainer,
-    DataCollatorForSeq2Seq
+    DataCollatorForSeq2Seq,
 )
 from torch.utils.data import Dataset
 import torch
+import matplotlib.pyplot as plt
+
 
 class KoreanChatDataset(Dataset):
-    def __init__(self, data, tokenizer, max_length=128):
+    def __init__(self, data, tokenizer, max_length: int = 128):
         self.data = data
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -27,52 +29,95 @@ class KoreanChatDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
+        """
+        Возвращает словарь с input_ids, attention_mask, labels.
+        Trainer сам считает суммарный loss (здесь он соответствует
+        языковому моделированию, т.е. «классификации» токенов).
+        Отдельного bbox-лосса в этой модели нет.
+        """
         row = self.data.iloc[idx]
-        input_text = str(row['question']).strip()
-        target_text = str(row['answer']).strip()
-        
-        # Проверка на пустые строки
+        input_text = str(row["question"]).strip()
+        target_text = str(row["answer"]).strip()
+
         if not input_text or not target_text:
-            # Возвращаем пустую последовательность, если данные некорректны
             input_text = "안녕하세요"
             target_text = "안녕하세요"
 
-        # Токенизация входного текста
-        input_encodings = self.tokenizer(
+        # Токенизация входа
+        model_inputs = self.tokenizer(
             input_text,
             max_length=self.max_length,
             padding="max_length",
             truncation=True,
-            return_tensors="pt"
         )
 
-        # Токенизация целевого текста (для labels)
-        target_encodings = self.tokenizer(
-            target_text,
-            max_length=self.max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt"
-        )
+        # Токенизация цели (labels)
+        with self.tokenizer.as_target_tokenizer():
+            labels = self.tokenizer(
+                target_text,
+                max_length=self.max_length,
+                padding="max_length",
+                truncation=True,
+            )["input_ids"]
 
-        # Получаем labels из input_ids
-        labels = target_encodings["input_ids"].clone()
-        
-        # КРИТИЧНО: Заменяем padding token id на -100 для игнорирования в loss
-        # Проверяем, что pad_token_id установлен
         pad_token_id = self.tokenizer.pad_token_id
         if pad_token_id is None:
-            # Если pad_token не установлен, используем eos_token или unk_token
-            pad_token_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
+            pad_token_id = self.tokenizer.eos_token_id or 0
             self.tokenizer.pad_token_id = pad_token_id
-        
-        labels[labels == pad_token_id] = -100
 
-        return {
-            "input_ids": input_encodings["input_ids"].squeeze(0),
-            "attention_mask": input_encodings["attention_mask"].squeeze(0),
-            "labels": labels.squeeze(0)
-        }
+        # Маскируем паддинги как -100, чтобы не входили в loss
+        labels = [tid if tid != pad_token_id else -100 for tid in labels]
+        model_inputs["labels"] = labels
+        return model_inputs
+
+
+def _plot_losses_from_history(log_history, output_dir: Path):
+    """
+    Строит график средних train/val потерь по эпохам.
+
+    Для нашей seq2seq модели:
+      - потери «классификации» токенов и «total loss» совпадают;
+      - отдельного bbox-лосса нет, поэтому на графике — именно суммарный loss.
+    """
+    train_loss_per_epoch = {}
+    eval_loss_per_epoch = {}
+
+    for record in log_history:
+        epoch = record.get("epoch")
+        if epoch is None:
+            continue
+
+        if "loss" in record:
+            train_loss_per_epoch.setdefault(epoch, []).append(record["loss"])
+        if "eval_loss" in record:
+            eval_loss_per_epoch.setdefault(epoch, []).append(record["eval_loss"])
+
+    train_epochs = sorted(train_loss_per_epoch.keys())
+    eval_epochs = sorted(eval_loss_per_epoch.keys())
+
+    mean_train = [sum(train_loss_per_epoch[e]) / len(train_loss_per_epoch[e]) for e in train_epochs] if train_epochs else []
+    mean_eval = [sum(eval_loss_per_epoch[e]) / len(eval_loss_per_epoch[e]) for e in eval_epochs] if eval_epochs else []
+
+    plots_dir = config.LOGS_DIR / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    plot_path = plots_dir / "loss_curves.png"
+
+    plt.figure(figsize=(8, 5))
+    if train_epochs:
+        plt.plot(train_epochs, mean_train, "-o", label="Train total loss")
+    if eval_epochs:
+        plt.plot(eval_epochs, mean_eval, "-o", label="Val total loss")
+
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Train / Val total loss per epoch")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+
+    print(f"График потерь сохранён в: {plot_path}")
 
 def train():
     print("=" * 50)
@@ -141,8 +186,9 @@ def train():
     # Проверка первого примера
     sample = train_dataset[0]
     print(f"Проверка примера:")
-    print(f"  input_ids shape: {sample['input_ids'].shape}")
-    print(f"  labels shape: {sample['labels'].shape}")
+    print(f"  input_ids length: {len(sample['input_ids'])}")
+    print(f"  labels length: {len(sample['labels'])}")
+    print(f"  labels != -100: {sum(1 for x in sample['labels'] if x != -100)}")
     print(f"  labels не -100: {(sample['labels'] != -100).sum().item()} токенов")
     print(f"  pad_token_id: {tokenizer.pad_token_id}")
 
@@ -150,29 +196,27 @@ def train():
     print("\n4. Настройка параметров обучения...")
     args = Seq2SeqTrainingArguments(
         output_dir=str(config.MODELS_DIR / "checkpoints"),
-        eval_strategy="steps",  # Исправлено: eval_strategy вместо evaluation_strategy
-        eval_steps=200,  # Оценка каждые 200 шагов
-        save_strategy="steps",
-        save_steps=200,
-        learning_rate=config.TRAIN_CONFIG['learning_rate'],
-        per_device_train_batch_size=config.TRAIN_CONFIG['batch_size'],
-        per_device_eval_batch_size=config.TRAIN_CONFIG['batch_size'],
+        evaluation_strategy="epoch",  # современный параметр в transformers>=4.36
+        save_strategy="epoch",
+        learning_rate=config.TRAIN_CONFIG["learning_rate"],
+        per_device_train_batch_size=config.TRAIN_CONFIG["batch_size"],
+        per_device_eval_batch_size=config.TRAIN_CONFIG["batch_size"],
         weight_decay=0.01,
         save_total_limit=2,
-        num_train_epochs=config.TRAIN_CONFIG['epochs'],
+        num_train_epochs=config.TRAIN_CONFIG["epochs"],
         predict_with_generate=True,
         fp16=config.USE_FP16,
         logging_dir=str(config.LOGS_DIR),
-        logging_steps=config.TRAIN_CONFIG['logging_steps'],
+        logging_strategy="epoch",
         dataloader_num_workers=0,  # 0 для Windows
         load_best_model_at_end=True,
         metric_for_best_model="loss",
         greater_is_better=False,
-        report_to="none",  # Отключаем wandb/tensorboard если не нужны
+        report_to="none",
         remove_unused_columns=False,
-        warmup_steps=config.TRAIN_CONFIG.get('warmup_steps', 100),
-        gradient_accumulation_steps=1,  # Для экономии памяти
-        max_grad_norm=1.0,  # Предотвращает взрыв градиентов
+        warmup_steps=config.TRAIN_CONFIG.get("warmup_steps", 100),
+        gradient_accumulation_steps=1,
+        max_grad_norm=1.0,
     )
 
     data_collator = DataCollatorForSeq2Seq(
@@ -194,7 +238,7 @@ def train():
     print("=" * 50)
     
     try:
-        trainer.train()
+        train_output = trainer.train()
         print("\n" + "=" * 50)
         print("ОБУЧЕНИЕ ЗАВЕРШЕНО УСПЕШНО!")
         print("=" * 50)
@@ -204,8 +248,12 @@ def train():
         traceback.print_exc()
         return
 
-    # 5. Сохранение
-    print("\n6. Сохранение модели...")
+    # 5. Построение графика потерь по эпохам
+    print("\n6. Построение графика потерь...")
+    _plot_losses_from_history(trainer.state.log_history, config.LOGS_DIR)
+
+    # 6. Сохранение
+    print("\n7. Сохранение модели...")
     final_path = config.MODELS_DIR / "korean_bot_final"
     model.save_pretrained(final_path)
     tokenizer.save_pretrained(final_path)
